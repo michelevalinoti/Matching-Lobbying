@@ -1,810 +1,642 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-|
 """
-Created on Sun Jun 18 19:07:22 2023
+Created on Sat Jul 27 16:59:17 2024
 
 @author: michelev
 """
 
 import numpy as np
 import pandas as pd
-
-import re
-
-#import spacy
-#import en_core_web_sm
-from nltk.corpus import words as nltk_words
-from nltk.corpus import stopwords
-
-#import enchant
-
-from unidecode import unidecode
-
-from nameparser import HumanName
-from nameparser.config import CONSTANTS
-CONSTANTS.titles.add('assembly member')
-CONSTANTS.titles.add('assemblywoman')
-CONSTANTS.titles.add('assemblyman')
-
-from fuzzywuzzy import fuzz, process
-from jarowinkler import jarowinkler_similarity
-from textdistance import levenshtein, hamming
+import json
+from scipy.optimize import fsolve, minimize, root
+from scipy.integrate import quad, cumulative_trapezoid
+from scipy.interpolate import CubicSpline
+from scipy.stats import truncnorm
+from sklearn.preprocessing import MinMaxScaler
 
 #%%
 
-def returnBasicStats(groupObject, include_share_zeros = False):
-    
-    stats = [groupObject.mean(), groupObject.std(), groupObject.min(), groupObject.max()]
-    
-    if include_share_zeros:
-        
-        stats = stats + [sum(groupObject == 0)/len(groupObject)]
-    
-    return stats
+def normalize_columns(df, columns_to_normalize):
+    scaler = MinMaxScaler()
+    normalized_data = scaler.fit_transform(df[columns_to_normalize])
+    normalized_df = pd.DataFrame(normalized_data, columns=[col + '_norm' for col in columns_to_normalize], index=df.index)
+    return pd.concat([df, normalized_df], axis=1)
 
-def splitSubjectsLobbied(s):
-
-    if pd.isna(s) == False:
-
-        return s.split('\n')[0].split('-')[0].split('–')[0].rstrip()
-    
-    else:
-        
-        return s
-
-def extractCompensation(s):
-
-    if pd.isna(s) == False:
-
-        return int(s.replace('$', '').replace(',', ''))
-    
-    else:
-        
-        
-        return s
-
-def remove_accents_from_string(s):
-    if isinstance(s, str):  # Check if the value is a string
-        return unidecode(s)
-    else:
-        return s
-    
-def extract_years(row):
-    if isinstance(row, str): 
-        years = [int(y) for y in row.split() if y.isdigit()]
-    else:
-        years = [row]
-    return years
-
-def extract_city_state_phone(col):
-    
-    col = col.split(' ')
-    no_entries = len(col)
-    phone = col[no_entries-1]
-    state = col[no_entries-2]
-    city = ' '.join([city_word.capitalize() for city_word in col[:no_entries-2]])
-    
-    return city, state, phone
-
-def renameColumn(col):
-    
-    if col == 'GovernmentBody/Agency':
-        
-        new_col = 'govt_body'
-        
-    elif col == 'LobbyingFocus':
-    
-        new_col = 'focus_level'
-        
-    elif col == 'LobbyingFocusNumberOrDescription':
-    
-        new_col = 'focus'
-        
-    elif col == 'TypeOfLobbyingCommunication':
-    
-        new_col = 'communication'
-        
-    elif col == 'TypeOfLobbyist':
-        
-        new_col = 'lobbyist_type'
-        
-    else:
-        
-        new_col = ''
-        
-        for char in col:
-            if char.isupper():
-                new_col += '_' + char.lower()
-            else:
-                new_col += char.lower()
-        
-        
-        
-        # Remove leading underscore if present
-        new_col = new_col.lstrip('_')
-        
-    
-    return new_col
-    
-
-
-def splitColumnHeaders(column_list):
-    
-    transformed_column_list = []
-    
-    for col in column_list:
-        
-        split = col.split('&')
-        if len(split)==1:
-            transformed_column_list.append(col)
-        else:
-            transformed_column_list.append( "\makecell[b]{" + split[0] + " \\\ " + split[1]  + "}")
-            
-    return transformed_column_list
-
-def stripOnlyString(string):
-    
-    new_string = ''
-    
-    if pd.isna(string) == False:
-        
-        new_string = string.strip()
-    
-    else:
-        
-        new_string = string
-        
-    return new_string
-
-def fromDateToBiMonth(date):
-    
-    
-def fromFilingPeriodToBimonth(filing_period):
-    
-    dict_bimonth = {'JANUARY/FEBRUARY': 1,
-                    'MARCH/APRIL': 2,
-                    'MAY/JUNE': 3,
-                    'JULY/AUGUST': 4,
-                    'SEPTEMBER/OCTOBER': 5,
-                    'NOVEMBER/DECEMBER': 6}
-    
-    return dict_bimonth[filing_period]
- 
-
-# Custom scoring function
-def custom_scorer(query, choice):
-    
-    less_important_words = ['NY', 'NYS', 'NEW', 'YORK']
-    # Split the query and choice into words
-    query_words = query.split()
-    choice_words = choice.split()
-    
-    # Initialize a score
-    score = 0
-    
-    # Calculate the score for each word pair
-    for query_word in query_words:
-        for choice_word in choice_words:
-            # Assign a weight based on importance
-            weight = 1 if query_word not in less_important_words else 0.5
-            
-            # Add the weighted score to the total score
-            score += fuzz.ratio(query_word, choice_word) * weight
-    
-    return score
-
-def fromYearToSessionId(year, sessions_df):
-     
-     if isinstance(year, str):
-         pattern = r'\b\d{4}\b'
-         years = re.findall(pattern, year)
-         years = [int(year) for year in years]
-         return sessions_df.loc[(sessions_df.session_odd_year == years[0]) | (sessions_df.session_even_year == years[0]),'session_id'].values[0]
-     
-     return sessions_df.loc[(sessions_df.session_odd_year == year) | (sessions_df.session_even_year == year),'session_id'].values[0]
-
-def fuzzy_match(row, choices, column_to_match, scorer=fuzz.ratio, threshold=70):
+def save_optimize_result_to_json(result, filename, exclude_attrs=None):
     """
-    Function to perform fuzzy matching using fuzzywuzzy.
+    Save OptimizeResult to a JSON file, excluding specified attributes.
     
-    Args:
-    row: A row from the first dataframe.
-    choices: A list of strings from the second dataframe column you want to match against.
-    scorer: The scoring function to use (default is fuzz.ratio).
-    threshold: The minimum score for a match to be considered valid (default is 90).
+    Parameters:
+    - result (OptimizeResult): The optimization result object.
+    - filename (str): The name of the JSON file to save.
+    - exclude_attrs (list of str): List of attribute names to exclude from serialization.
+    """
+    serializable_dict = optimize_result_to_serializable_dict(result, exclude_attrs)
+    
+    try:
+        with open(filename, 'w') as json_file:
+            json.dump(serializable_dict, json_file, indent=4)
+        print(f"Optimization result successfully saved to {filename}")
+    except Exception as e:
+        print(f"Failed to save optimization result to JSON: {e}")
+        
+def optimize_result_to_serializable_dict(result, exclude_attrs=None):
+    """
+    Convert OptimizeResult to a dictionary with serializable types, excluding specified attributes.
+    
+    Parameters:
+    - result (OptimizeResult): The optimization result object.
+    - exclude_attrs (list of str): List of attribute names to exclude from serialization.
     
     Returns:
-    The best match from the choices if it meets the threshold, otherwise None.
+    - dict: A dictionary representation of the OptimizeResult suitable for serialization.
     """
-    best_match, score, index = process.extractOne(row[column_to_match], choices, scorer=scorer)
+    if exclude_attrs is None:
+        exclude_attrs = []
     
-    return index if score >= threshold else None
-def findBillCode(focus_string):
+    serializable_dict = {}
     
-    pattern = r'(S*\d+)|(S\s*\d+)|(S\.\s*\d+)|(S\.\s*\d+)|(A*\d+)|(A\s*\d+)|(A\.\s*\d+)|(A\.\s*\d+)'
-    matches = re.findall(pattern, focus_string)
-    
-    special_substrings = []
-    for match in matches:
-        for group in match:
-            if group:
-                special_substrings.append(group)
-    if len(special_substrings)>0:
-    
-        new_focus_bill = special_substrings[0].replace(' ', '').replace('.', '');
-       
-        prefix = new_focus_bill[0]
-        numbers = new_focus_bill[1:]
+    for key, value in result.items():
+        if key in exclude_attrs:
+            continue  # Skip excluded attributes
         
-        zeros_to_add = 6 - len(new_focus_bill)
-        if zeros_to_add > 0:
-            adjusted_string = prefix + '0' * zeros_to_add + numbers
-            new_focus_bill = adjusted_string
-    
-        return new_focus_bill
-    
-    return focus_string
-
-def returnFullName(name_dict, substitute_nickname = False, drop_middle_name = False, new_nicknames = None):
-    
-    full_name = ''
-    
-    for col in ['first_name', 'middle_name', 'last_name', 'suffix']:
-        
-        if pd.isna(name_dict[col]) == False:
-            
-            if (col == 'first_name') & (((pd.isna(name_dict['nickname']) == False) & (pd.isna(name_dict['first_name']) == True)) | ((pd.isna(name_dict['nickname']) == False) & (substitute_nickname == True))):
-                col = 'nickname'
-            if (col == 'first_name') & (substitute_nickname == True) & (new_nicknames != None):
-                if name_dict['first_name'] in new_nicknames.keys():
-                    full_name = full_name + str(new_nicknames[name_dict['first_name']]) + ' '
-                    continue
-            if (col == 'middle_name') & (drop_middle_name == True):
-                continue
-            else:
-                full_name = full_name + str(name_dict[col]) + ' '
-        
-    return full_name.rstrip()
-
-def manipulatePartyName(identifier, df, dictionary, drop_words, substitute_manual, new_nicknames, committee_df_dict, people_df_dict, homonim_names_dict, similar_names_dict):
-    
-    name = df.loc[df.parties_lobbied_id == identifier, "party_name"].values[0]
-    
-    
-            
-    chamber_id = df.loc[df.parties_lobbied_id == identifier, "chamber_id"].values[0]
-    session_id = df.loc[df.parties_lobbied_id == identifier, "session_id"].values[0]
-    role_id = 0
-    
-    if chamber_id == 73:
-        
-        committee_df = committee_df_dict[session_id].loc[committee_df_dict[session_id].chamber_name == 'ASSEMBLY', :]
-        
-    elif chamber_id == 74:
-        
-        committee_df = committee_df_dict[session_id].loc[committee_df_dict[session_id].chamber_name == 'SENATE', :]
-    
-    if chamber_id == 73:
-        
-        role_id = 1
-        
-    elif chamber_id == 74:
-        
-        role_id = 2
-        
-    session_ids = list(people_df_dict.keys())
-    
-    name_dict = {'contacted_staff_counsel': False,
-                 'is_staff_counsel': False,
-                 'entire_body': False,
-                 'majority_body': False,
-                 'minority_body': False,
-                 'entire_committee': False,
-                 'committee': None,
-                 'other': False,
-                 'people_id': None,
-                 'check_rule': ''}
-
-    
-    original_name = name
-    
-    name = name.upper()
-    name = name.replace('.', '. ').replace('  ', ' ')
-    name = name.replace(",", "")
-    name = name.replace(".", "")
-    name = name.replace("(", "")
-    name = name.replace(")", "")
-    name = name.replace("@", "")
-    
-    for substitutes_manual in substitute_manual.keys():
-        
-        if name in substitutes_manual:
-            
-            role = substitute_manual[substitutes_manual][1]
-            people_id = substitute_manual[substitutes_manual][0]
-            
-            name_dict['check_rule'] = 'manual_substitution'
-            name_dict['people_id'] = people_id
-            
-            if 'STAFF' in role:
-                
-                name_dict['contacted_staff_counsel'] = True
-                name_dict['is_staff_counsel'] = True
-                
-            
-            return name_dict
-    
-    words = name.split(' ')
-    
-    # for committee in committee_df.committee_name.values:
-        
-    #     words_committee = committee.split(' ');
-    #     if (committee in name) & (len(words_committee) > 1):
-            
-    #         target_idx = -1
-    #         for word in words:
-                
-    #             target_idx += 1
-    #             if word == words_committee[0]:
-                    
-    #                 words[target_idx] = committee
-    #                 for i in range(1,len(words_committee)-1):
-    #                     words.remove(words[target_idx+i])
-                
-    #                 break
-            
-            
-                
-                
-    
-    count_persons = 0
-    
-    for word_idx in range(len(words)):
-        
-        if words[word_idx].endswith("'S"):
-            words[word_idx] = words[word_idx][:-2]
-            
-        elif words[word_idx].endswith("'"):
-            words[word_idx] = words[word_idx][:-1]
-            
-            
-    for word in words:
-        
-        if word == 'SENATOR':
-            count_persons += 1
-            
-    # if count_persons > 1:
-        
-    #     senators = name.split('SENATOR')
-    #     senators = [senator.strip() for senator in senators]
-    #     if 'NYS' in senators:
-    #         senators.remove('NYS')
-    #     if 'STAFF FOR' in senators:
-    #         idx = 0
-    #         for string in senators:
-    #             if string == 'STAFF FOR':
-    #                 senators.append(senators[idx] + senators[idx+1])
-    #                 break
-    #             idx += 1
-    #         senators.remove(senators[idx])
-    #         senators.remove(senators[idx+1])
-        
-    #     multiple_rows = []
-    #     for senator in senators:
-            
-    #         #print(senator)
-    #         multiple_rows.append(manipulatePartyName(senator, nlp, dictionary, committees))
-        
-    #     return multiple_rows
-    
-    for word in words:
-        
-        subwords = word.split('-')
-        
-        if (word != '-') & (len(subwords)==2):
-             
-            if len(subwords[0])*len(subwords[1])>0:
-                
-                if (subwords[0].lower() in dictionary) | (subwords[1].lower() in dictionary):
-                    words.remove(word)
-                    words.append(subwords[0])
-                    words.append(subwords[1])
-                    
-                
-                        
-            #for subword in subwords:
-            
-    
-    count_words = len(words)
-    
-    # non-dicionary words
-    proper_words = []
-    for word in words:
-        if (word.lower() not in dictionary) & (word.upper() not in drop_words):
-            proper_words.append(word)
-    # check whether the report string contains exactly the (1-word) last name
-    
-    
-    def matchPersonName(people_df_dict, session_id, words):
-        
-        contains_member_name = False
-        matched_string = ''
-        matched_string_idx = 0
-        matched_string_position = {}
-        for string in words:
-            matched_string_idx += 1
-            #string = string.replace("-", "")
-            if string in set(people_df_dict[session_id].last_name):
-                contains_member_name = True
-                matched_string = string
-                matched_string_position[matched_string_idx] = matched_string
-            
-        if contains_member_name == True:
-            matched_string_idx = max(matched_string_position.keys())
-            if (len(matched_string_position) > 1) & (words[min(max(matched_string_position.keys())+1, len(words)-1)] == 'STAFF'):
-                matched_string_idx = min(matched_string_position.keys())
-            matched_string = matched_string_position[matched_string_idx]
-            
-        length_multiple_word_lastnames = people_df_dict[session_id].last_name.apply(lambda s: s.split(' ')).apply(len)
-        
-        if contains_member_name == False:
-            
-            break_loop = False
-            for j in range(2,max(length_multiple_word_lastnames)+1):
-                multiple_word_lastnames = people_df_dict[session_id].last_name.apply(lambda s: s.split(' '))[length_multiple_word_lastnames==j]
-                for multiple_word_lastname in multiple_word_lastnames:
-                    check_last_name = True
-                    for i in range(j-1,len(words)):
-                        word = words[i]
-                        check_last_name = check_last_name & (string in multiple_word_lastname)
-                    if check_last_name:
-                        matched_string = ' '.join(multiple_word_lastname)
-                
-                    
-        return contains_member_name, matched_string
-        
-    
-    contains_member_name, matched_string = matchPersonName(people_df_dict, session_id, words)
-    
-    new_session_id = session_id
-    
-    if (contains_member_name == False) & (len(proper_words)>0):
-        
-        session_id_idx = np.where(session_ids==session_id)[0][0]
-        
-        contains_member_name, matched_string = matchPersonName(people_df_dict, session_ids[max(session_id_idx+1, len(session_ids)-1)], words)
-        
-        if contains_member_name  == True:
-            name_dict['check_rule'] = 'contains_exact_name_other_session'
-            new_session_id = session_ids[max(session_id_idx+1, len(session_ids)-1)]
-            
-        elif contains_member_name  == False:
-            
-            for i in range(1,len(session_ids)-1):
-                
-                contains_member_name, matched_string = matchPersonName(people_df_dict, session_ids[max(session_id_idx-i, 0)], words)
-
-                if contains_member_name  == True:
-                    name_dict['check_rule'] = 'contains_exact_name_other_session'
-                    new_session_id = session_ids[max(session_id_idx-i, 0)]
-                    break
-        
-        
-    session_id = new_session_id
-    contains_committee_name = False
-    
-    stop_words = set(stopwords.words('english'))
-    matched_committee = ''
-    for committee in committee_df.committee_name.values:
-        
-        committee_words = committee.split(' ')
-        committee_words = [word for word in committee_words if word.lower() not in stop_words]
-        for word in [word for word in words if word.lower() not in stop_words]:
-            
-            matched_chars = 0
-            for committee_word in committee_words:
-                if committee_word == word:
-                    
-                    matched_chars += 1
-                    
-                if matched_chars > 0:
-                        
-                    if (len(committee_words) <= 2) & (len(committee_words) == matched_chars):
-                        
-                        contains_committee_name = True
-                        matched_committee = committee
-                        break
-                    
-                    elif  (len(committee_words) > 2) & (len(committee_words)/matched_chars >= 0.75):
-                    
-                        contains_committee_name = True
-                        matched_committee = committee
-                        break
-    
-    if contains_member_name:
-        
-        if name_dict['check_rule'] != 'contains_exact_name_other_session':
-            name_dict['check_rule'] = 'contains_exact_name'
-        
-        
-        inferred_name_text = " ".join(proper_words)
-        # doc = nlp(inferred_name)
-        
-        # # Extract proper names
-        # proper_names = []
-        # for ent in doc.ents:
-        #      if ent.label_ == "PERSON":
-        #          proper_names.append(ent.text)
-                 
-        if len(inferred_name_text)>0:
-            inferred_name = returnHumanName(inferred_name_text)
+        if isinstance(value, np.ndarray):
+            serializable_dict[key] = value.tolist()
+        elif isinstance(value, (bool, int, float, str)) or value is None:
+            serializable_dict[key] = value
+        elif isinstance(value, (dict, list, tuple)):
+            serializable_dict[key] = value  # Assuming nested structures are JSON-serializable
         else:
-            name_dict['possible_error'] = True
-        
-        
-        if matched_string in homonim_names_dict[session_id].last_name.values:
-        
-            name_dict['check_rule'] = 'contains_homonimous_name'
-            matched_subdf = homonim_names_dict[session_id].loc[(homonim_names_dict[session_id].last_name == matched_string)]
-            roles_subdf = homonim_names_dict[session_id].loc[(homonim_names_dict[session_id].last_name == matched_string) & (homonim_names_dict[session_id].role_id == role_id)]
-            
-            
-            if len(roles_subdf) == 1:
-                name_subdf = roles_subdf.copy()
-                
-            elif (len(inferred_name['first']) > 0) & (sum(roles_subdf.first_name == inferred_name['first'])):
-                
-                name_subdf = roles_subdf.loc[roles_subdf.first_name == inferred_name['first']]
-                
-            else:
-                
-                matched_subdf['similarity'] = matched_subdf.first_name.apply(lambda name: jarowinkler_similarity(inferred_name['first'], name))
-                name_subdf = matched_subdf.loc[matched_subdf.similarity == max(matched_subdf.similarity)]
-            
-        else:
-        
-            name_subdf = people_df_dict[session_id].loc[people_df_dict[session_id].last_name == matched_string,:]
-            
-            if matched_string in similar_names_dict[session_id].last_name.values:
-                
-                name_dict['check_rule'] = 'contains_similar_name'
-                
-                if name_subdf.first_name.iloc[0] != inferred_name['first']:
-                    name_dict['possible_error'] = True
-                
-            name_subdf = people_df_dict[session_id].loc[people_df_dict[session_id].last_name == matched_string,:]
-        
-        name_dict['people_id'] = name_subdf.index[0]
-        for col in ['name', 'first_name', 'middle_name', 'last_name', 'suffix', 'nickname']:
-            
-            name_dict[col] = name_subdf.iloc[0][col]
-            
-        name_dict['full_name'] = returnFullName(name_dict)
-        name_dict['full_name_with_nickname'] = returnFullName(name_dict, substitute_nickname = True)
-        name_dict['full_name_wo_middle_name'] = returnFullName(name_dict, substitute_nickname = False, drop_middle_name = True)
-        name_dict['full_name_with_alternative_nickname'] = returnFullName(name_dict, substitute_nickname = True, drop_middle_name = True, new_nicknames = new_nicknames)
-        
-        if 'STAFF' in words:
-            
-            name_dict['contacted_staff_counsel'] = True
+            # For complex objects like hess_inv, convert to string or handle appropriately
+            serializable_dict[key] = str(value)
     
+    return serializable_dict
+
+def perturb_duplicates(valuations, epsilon=1e-8):
+    """
+    Add a small deterministic perturbation to duplicate valuations to ensure uniqueness.
+
+    Parameters:
+    - valuations: np.ndarray, array of valuations
+    - epsilon: float, magnitude of the perturbation
+
+    Returns:
+    - valuations_unique: np.ndarray, array of valuations with duplicates perturbed
+    """
+    valuations = valuations.copy()  # Avoid modifying the original array
+
+    # **Efficiently check for duplicates**
+    _, counts = np.unique(valuations, return_counts=True)
+    if np.all(counts == 1):
+        # No duplicates found; return the original valuations immediately
+        return valuations
+
+    # **Proceed to perturb duplicates only if duplicates are found**
+
+    # Sort the valuations and keep track of the original indices
+    sorted_indices = np.argsort(valuations)
+    sorted_valuations = valuations[sorted_indices]
+
+    # Initialize an array to hold the perturbations
+    perturbations = np.zeros_like(valuations)
+
+    # Initialize variables to keep track of duplicates
+    i = 0
+    n = len(valuations)
+
+    while i < n:
+        # Identify the current valuation
+        current_valuation = sorted_valuations[i]
+
+        # Find all indices where the valuation is equal to current_valuation
+        j = i + 1
+        duplicate_count = 1  # Count of duplicates, including the current one
+        while j < n and sorted_valuations[j] == current_valuation:
+            duplicate_count += 1
+            j += 1
+
+        # Apply deterministic perturbations to duplicates
+        if duplicate_count > 1:
+            # For duplicates, generate perturbations: epsilon*0, epsilon*1, epsilon*2, ...
+            for k in range(duplicate_count):
+                idx = i + k
+                perturbations[sorted_indices[idx]] = epsilon * k  # First occurrence gets 0
+
+        # Move to the next unique valuation
+        i = j
+
+    # Apply perturbations to valuations
+    valuations += perturbations
+
+    return valuations
     
-        if len(inferred_name_text) > 0:
-            
-            
-            dist1 = jarowinkler_similarity(returnHumanName(inferred_name_text, False), name_dict['name'].upper())
-            dist2 = jarowinkler_similarity(returnHumanName(inferred_name_text, False), name_dict['full_name'].upper())
-            dist3 = jarowinkler_similarity(returnHumanName(inferred_name_text, False), name_dict['full_name_with_nickname'].upper())
-            dist4 = jarowinkler_similarity(returnHumanName(inferred_name_text, False), name_dict['full_name_wo_middle_name'].upper())
-            dist5 = jarowinkler_similarity(returnHumanName(inferred_name_text, False), name_dict['full_name_with_alternative_nickname'].upper())
-            if (max([dist1,dist2, dist3, dist4, dist5]) <= 0.9) & (len(proper_words) > 1):
-                    
-            #if len(inferred_name['middle']) > 0:
-                
-            #    if inferred_name['middle'] != name_dict['middle_name']:
-                    
-                name_dict['possible_error'] = True
-                
-    elif contains_committee_name:
-        
-        name_dict['check_rule'] = 'contains_committee_name'
-        name_dict['committee_name'] = matched_committee
-        name_dict['committee_id'] = committee_df.loc[committee_df.committee_name == matched_committee,'committee_id'].values[0]
-                
-    elif (contains_member_name == False ) & (len(proper_words)>0):
-        
-        name_dict['check_rule'] = 'contains_proper_name'
-        
+
+def get_truncnorm_params(mean, left, right, scale):
+    a = (left - mean) / scale
+    b = (right - mean) / scale
+    return a, b, mean, scale
+
+def get_truncnorm_upper_bound(truncnorm_distribution):
+    """
+    Returns the largest value in the support of the truncated normal distribution.
+    
+    :param truncnorm_distribution: A scipy.stats.truncnorm distribution object.
+    :return: The upper bound of the support.
+    """
+    # Extract the arguments from the distribution
+    a, b, loc, scale = truncnorm_distribution.args
+    return b * scale + loc
+
+def get_truncnorm_lower_bound(truncnorm_distribution):
+    """
+    Returns the smallest value in the support of the truncated normal distribution.
+    
+    :param truncnorm_distribution: A scipy.stats.truncnorm distribution object.
+    :return: The lower bound of the support.
+    """
+    # Extract the arguments from the distribution
+    a, b, loc, scale = truncnorm_distribution.args
+    return a * scale + loc
+
+def get_truncnorm_range(truncnorm_distribution):
+    
+    value_range = np.array([get_truncnorm_lower_bound(truncnorm_distribution), get_truncnorm_upper_bound(truncnorm_distribution)])
+    
+    return value_range
+
+def generate_predictors(N, K, means, lower_bounds, upper_bounds, scales):
+    """
+    Generate uncorrelated predictors with specified means using truncated normal distributions.
+
+    :param N: Number of observations.
+    :param K: Number of predictors.
+    :param means: List or array of means for each predictor (length K).
+    :param lower_bounds: List or array of lower bounds for each predictor (length K).
+    :param upper_bounds: List or array of upper bounds for each predictor (length K).
+    :param scales: List or array of scales (standard deviations) for each predictor (length K).
+    :return: A NumPy array of shape (N, K) containing the generated predictors.
+    """
+    X = np.zeros((N, K))
+    for j in range(K):
+        a, b = (lower_bounds[j] - means[j]) / scales[j], (upper_bounds[j] - means[j]) / scales[j]
+        X[:, j] = truncnorm(a, b, loc=means[j], scale=scales[j]).rvs(N)
+    return X
+
+def f_derivative(f, x, h=1e-5):
+    return (f(x + h) - f(x - h)) / (2 * h)
+
+def virtual_valuation(v, F, f, h, epsilon=1e-8):
+    if h == "P":
+        f_value = f(v)
+        return v - (1 - F(v)) / np.maximum(f_value,epsilon)  # Adjust as needed for your case
+    elif h == "W":
+        return v
+    
+def virtual_valuation_derivative(v, F, f, h):
+    if h == "P":
+        f_prime = lambda x: f_derivative(f,x)
+        return 2 + (1 - F(v)) * f_prime(v) / (f(v)**2)
+    elif h == "W":
+        return 1
+    
+def empirical_pdf(v_values, F_values, method = "central", epsilon=1e-10):
+    """
+    Compute the numerical derivative of the empirical CDF to get the PDF.
+    
+    :param v_values: Array of valuation points.
+    :param F_values: Array of CDF values corresponding to v_values.
+    :param epsilon: A small value added to prevent zero PDF values.
+    :return: Array of PDF values corresponding to v_values.
+    """
+    sorted_indices = np.argsort(v_values)
+    v_values = v_values[sorted_indices]
+    F_values = F_values[sorted_indices]
+    # Use central differences to approximate the derivative (PDF)
+    f_values = np.zeros_like(F_values)
+    
+    # Choose method for interior points
+    if method == 'central':
+        # Central difference for interior points
+        f_values[1:-1] = (F_values[2:] - F_values[:-2]) / (v_values[2:] - v_values[:-2])
+    elif method == 'forward':
+        # Forward difference for interior points
+        f_values[1:-1] = (F_values[2:] - F_values[1:-1]) / (v_values[2:] - v_values[1:-1])
+    elif method == 'backward':
+        # Backward difference for interior points
+        f_values[1:-1] = (F_values[1:-1] - F_values[:-2]) / (v_values[1:-1] - v_values[:-2])
     else:
-        
-        
-        if (('SENATE' in words) | ('ASSEMBLY' in words)):
-        
-            
-        
-            if ('STAFF' in words) | ('COUNSEL' in words):
-               
-                name_dict['contacted_staff_counsel'] = True
-                name_dict['is_staff_counsel'] = True
-               
-                # Process the phrase with spaCy
-                # doc = nlp(name)
-               
-                # # Extract proper names
-                # proper_names = []
-                # for ent in doc.ents:
-                #     if ent.label_ == "PERSON":
-                #         proper_names.append(ent.text)
-               
-                name_dict['check_rule'] = 'contains_staff_general'
-                
-                if len(proper_words) > 0:
-                  
-                    name_dict['is_staff_counsel'] = True
-                    name_dict = name_dict | returnHumanName(proper_words[0])
-                    
-                    name_dict['check_rule'] = 'contains_staff_name'
-                    
-                
-                
-                else:
-                    if 'MAJORITY' in words:
-                       
-                        name_dict['majority_body'] = True
-                        
-                        name_dict['check_rule'] = 'contains_majority_general'
-                        
-                    elif ('MINORITY' in words) | ('REPUBLICAN' in words):
-                       
-                        name_dict['minority_body'] = True
-                        
-                        name_dict['check_rule'] = 'contains_minority_general'
-                        
-                    else:
-                       
-                        name_dict['entire_body'] = True
-                        
-                        name_dict['check_rule'] = 'contains_body_general'
-               
-            if 'MAJORITY' in words:
-               
-                name_dict['majority_body'] = True
-                
-                name_dict['check_rule'] = 'contains_majority_general'
-                
-            elif ('MINORITY' in words) | ('REPUBLICAN' in words):
-               
-                name_dict['minority_body'] = True
-                
-                name_dict['check_rule'] = 'contains_minority_general'
-                
-            else:
-               
-                name_dict['entire_body'] = True
-                
-                name_dict['check_rule'] = 'contains_body_general'
-            
-        elif ('ALL' in words) | ('ENTIRE' in words):
-        
-            name_dict['entire_body'] = True
-        
-    # #elif 'MAJORITY' in words:
-        
-        
-        
-    # elif count_words == 1:
-        
-    #     if (name == 'STAFF') | (name == 'COUNSEL'):
-            
-    #         name_dict['contacted_staff_counsel'] = True
-    #         name_dict['is_staff_counsel'] = True
-            
-    #     elif (name == 'ALL') | (name == 'MEMBERS'):
-            
-    #         name_dict['entire_body'] = True
-            
-    #     elif name in committees:
-            
-    #         name_dict['committee'] = name
-    #         name_dict['entire_committee'] = True
-            
-    #     else:
-            
-    #         name_dict = name_dict | returnHumanName(name)
+        raise ValueError("Method must be 'central', 'forward', or 'backward'.")
     
-    # elif 'DELEGATION' in words:
-        
-    #     name_dict['other'] = True
-        
-    # else:
-        
-    #     if ('STAFF' in words):
-            
-    #         name_dict['contacted_staff_counsel'] = True
-            
-    #         if name in committees:
-                
-    #             name_dict['committee'] = name
-                
-    #         elif 'MAJORITY' in words:
-                
-    #             name_dict['majority_body'] = True
-                
-    #         else:
-    #             words.remove('STAFF')
-    #             # Process the phrase with spaCy
-                
-    #             if len(words) == 1:
-                    
-    #                 return name_dict | returnHumanName(words[0])
-                
-    #             new_name = ''
-                
-    #             for word in words:
-                    
-    #                 new_name = new_name + word.capitalize() + ' '
-                    
-    #             new_name = new_name.rstrip()
-                
-    #             doc = nlp(new_name)
-                
-    #             # Extract proper names
-    #             proper_names = []
-    #             for ent in doc.ents:
-    #                 if ent.label_ == "PERSON":
-    #                     proper_names.append(ent.text)
-                
-    #             if len(proper_names) > 0:
-                    
-    #                 name_dict['is_staff_counsel'] = True
-    #                 name_dict = name_dict | returnHumanName(proper_names[0])
-            
-    #             return name_dict
-    #     else:
-            
-    #             new_name = ''
-                
-    #             for word in words:
-                    
-    #                 new_name = new_name + word.capitalize() + ' '
-                    
-    #             new_name = new_name.rstrip()
-                
-    #             doc = nlp(new_name)
-                
-    #             # Extract proper names
-    #             proper_names = []
-    #             for ent in doc.ents:
-    #                 if ent.label_ == "PERSON":
-    #                     proper_names.append(ent.text)
-                
-    #             if len(proper_names) > 0:
-                    
-    #                 name_dict['is_staff_counsel'] = True
-    #                 name_dict = name_dict | returnHumanName(proper_names[0])
-            
-    #             return name_dict
-            
-    
-    return name_dict
-    
-    
-        
-def returnHumanName(full_name, as_dict = True):
-    
-    human_name = HumanName(full_name)
-    
-    if (len(human_name.first) > 0) & (len(human_name.last) == 0):
-        
-        human_name.last = human_name.first
-        human_name.first = ''
-        
-    if as_dict == False:
-        
-        return human_name.full_name
-    
-    else:   
-        return human_name.as_dict()
-    
-    return human_name
+    # Compute PDF values for boundaries
+    f_values[0] = (F_values[1] - F_values[0]) / (v_values[1] - v_values[0])  # Forward difference at lower boundary
+    f_values[-1] = (F_values[-1] - F_values[-2]) / (v_values[-1] - v_values[-2])  # Backward difference at upper boundary
 
+    f_values = np.maximum(f_values, epsilon)
+    # Normalize the PDF
+    integral = np.trapz(f_values, v_values)
+    f_values /= integral
+    
+    return f_values
+
+
+def average_intensity_value(v, F, v_upper,epsabs=1.49e-8, epsrel=1.49e-8, limit=1000):
+    lambda x: sigma_prime(x)*F(x)
+    integral, error = quad(F, v, v_upper, epsabs=epsabs, epsrel=epsrel, limit=limit)
+    return sigma(v_upper) * F(v_upper) - sigma(v) * F(v) - integral + 1
+
+def average_intensity_vectorized(v_vector, F, v_upper):
+    """
+    Optimized version of average_intensity using cumulative integration.
+    
+    :param v_vector: Vector of lower bounds for the integral.
+    :param F: CDF function.
+    :param v_upper: Upper bound of the integral.
+    :return: Vector of average intensity values.
+    """
+    # Compute the cumulative integral from v_vector[0] to each point in v_vector
+    # Note: cumtrapz integrates over the range [v[0], v[-1]]
+    F_values = F(v_vector)
+    sigma_prime_values = sigma_prime(v_vector)
+    cumulative_integral = cumulative_trapezoid(sigma_prime_values * F_values, v_vector, initial=0)
+    
+    # Calculate average intensity using the cumulative integral
+    # F(v_upper) * sigma(v_upper) is constant across all v_k
+    average_intensity_values = sigma(v_upper) * F(v_upper) - sigma(v_vector) * F_values - cumulative_integral + 1
+    
+    return average_intensity_values
+    
+def average_intensity(v, F, v_upper, method="auto", epsabs=1.49e-2, epsrel=1.49e-4, limit=500):
+    """
+    Compute average intensity using either the scalar or vectorized approach.
+    
+    :param v: Scalar or vector of lower bounds for the integral.
+    :param F: CDF function.
+    :param v_upper: Upper bound of the integral.
+    :param method: Method to use ("auto", "scalar", or "vectorized").
+    :param epsabs: Absolute error tolerance for the integration.
+    :param epsrel: Relative error tolerance for the integration.
+    :param limit: Limit for the number of subdivisions in the integration.
+    :return: Scalar or vector of average intensity values.
+    """
+    if method == "auto":
+        if np.isscalar(v):
+            return average_intensity_value(v, F, v_upper, epsabs=epsabs, epsrel=epsrel, limit=limit)
+        else:
+            return average_intensity_vectorized(v, F, v_upper)
+    elif method == "scalar":
+        if np.isscalar(v):
+            return average_intensity_value(v, F, v_upper, epsabs=epsabs, epsrel=epsrel, limit=limit)
+        else:
+            raise ValueError("Input v is a vector, but 'scalar' method was specified.")
+    elif method == "vectorized":
+        if np.isscalar(v):
+            raise ValueError("Input v is a scalar, but 'vectorized' method was specified.")
+        else:
+            return average_intensity_vectorized(v, F, v_upper)
+    else:
+        raise ValueError("Invalid method specified. Use 'auto', 'scalar', or 'vectorized'.")
+
+
+def average_intensity_derivative(v, f):
+    return -sigma(v)*f(v)
+
+def euler_equation_long(v_k, v_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h):
+    return f_k(v_k)*f_l(v_l)*(sigma(v_l)*virtual_valuation(v_k, F_k, f_k, h)/average_intensity(v_l, F_l, v_upper_l) + sigma(v_k)*virtual_valuation(v_l, F_l, f_l, h)/average_intensity(v_k, F_k, v_upper_k))
+
+def euler_equation(v_k, v_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h):
+    marginal_surplus_k = sigma(v_l)*virtual_valuation(v_k, F_k, f_k, h)*average_intensity(v_k, F_k, v_upper_k) 
+    marginal_surplus_l = sigma(v_k)*virtual_valuation(v_l, F_l, f_l, h)*average_intensity(v_l, F_l, v_upper_l)
+    return marginal_surplus_k + marginal_surplus_l
+
+def penalized_euler_equation(v_k_vector, v_l, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, penalty=1e6):
+    """
+    Vectorized version of penalized Euler equation.
+
+    :param v_k_vector: Vector of v_k values.
+    :param v_l_vector: Vector of v_l values.
+    :param F_k: CDF function for side k.
+    :param f_k: PDF function for side k.
+    :param F_l: CDF function for side l.
+    :param f_l: PDF function for side l.
+    :param v_upper_k: Upper bound for side k.
+    :param v_lower_k: Lower bound for side k.
+    :param v_upper_l: Upper bound for side l.
+    :param v_lower_l: Lower bound for side l.
+    :param h: Parameter for the Euler equation.
+    :param penalty: Penalty value applied when v_l is out of bounds.
+    :return: Vector of penalized Euler equation values.
+    """
+    # Check if v_l values are out of bounds and apply the penalty
+    out_of_bounds = (v_l < v_lower_l) | (v_l > v_upper_l)
+    
+    # Calculate the Euler equation term where v_l is within bounds
+    euler_term = euler_equation(v_k_vector, v_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)
+    
+    # Apply penalty to out-of-bounds elements
+    euler_term[out_of_bounds] = penalty
+    
+    return euler_term
+
+def euler_equation_derivative(v_k, v_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h):
+    marginal_surplus_k = sigma(v_l)*(virtual_valuation_derivative(v_k, F_k, f_k, h)*average_intensity(v_k, F_k, v_upper_l)+virtual_valuation(v_k, F_k, f_k, h)*average_intensity_derivative(v_k,f_k))
+    marginal_surplus_l = sigma_prime(v_k)*virtual_valuation(v_l, F_l, f_l, h)*average_intensity(v_l, F_l, v_upper_l)
+    return marginal_surplus_k + marginal_surplus_l
+
+def compute_linear_guess(separating_range_k, separating_range_l, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h):
+    #midpoint_k = (separating_range_k[0] + separating_range_k[1]) / 2
+    #midpoint_l = (separating_range_l[0] + separating_range_l[1]) / 2
+    #t_midpoint = compute_threshold(midpoint_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, midpoint_l)
+    
+    # Fit a quadratic polynomial to these three points
+    coeffs = np.polyfit([separating_range_k[0], separating_range_k[1]], [separating_range_l[1], separating_range_l[0]], 1)
+    
+    return coeffs
+
+def compute_quadratic_guess(separating_range_k, separating_range_l, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h):
+    midpoint_k = (separating_range_k[0] + separating_range_k[1]) / 2
+    midpoint_l = (separating_range_l[0] + separating_range_l[1]) / 2
+    t_midpoint = compute_threshold(midpoint_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, midpoint_l)
+    
+    # Fit a quadratic polynomial to these three points
+    coeffs = np.polyfit([separating_range_k[0], midpoint_k, separating_range_k[1]], [separating_range_l[1], t_midpoint, separating_range_l[0]], 2)
+    
+    return coeffs
+
+def compute_cubic_spline_guess(separating_range_k, separating_range_l, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h):
+    # Calculate the original points in the separating range
+    point1_k = separating_range_k[0]
+    point2_k = separating_range_k[0] + 0.25 * (separating_range_k[1] - separating_range_k[0])
+    point3_k = separating_range_k[0] + 0.5 * (separating_range_k[1] - separating_range_k[0])
+    point4_k = separating_range_k[0] + 0.75 * (separating_range_k[1] - separating_range_k[0])
+    point5_k = separating_range_k[1]
+    
+    point2_l = separating_range_l[1] - 0.25 * (separating_range_l[1] - separating_range_l[0])
+    point3_l = separating_range_l[1] - 0.5 * (separating_range_l[1] - separating_range_l[0])
+    point4_l = separating_range_l[1] - 0.75 * (separating_range_l[1] - separating_range_l[0])    
+    
+    # Calculate the additional points 5% closer to the bounds
+    #point2_left_k = separating_range_k[0] + 0.05 * (separating_range_k[1] - separating_range_k[0])
+    #point2_right_k = separating_range_k[1] - 0.05 * (separating_range_k[1] - separating_range_k[0])
+
+    # Compute the thresholds at these points
+    t1 = separating_range_l[1]
+    t2 = compute_threshold(point2_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, point2_l)
+    t3 = compute_threshold(point3_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, point3_l)
+    t4 = compute_threshold(point4_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, point4_l)
+    t5 = separating_range_l[0]
+    
+    #t2_left = compute_threshold(point2_left_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, point2_left_k)
+    #t2_right = compute_threshold(point2_right_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, point2_right_k)
+
+    # Fit a cubic spline to these points
+    points_k = [point1_k, 
+                #point2_left_k, 
+                point2_k, point3_k, point4_k,
+                #point2_right_k,
+                point5_k]
+    t_values = [t1,
+                #t2_left,
+                t2,
+                t3,
+                t4,
+                #t2_right,
+                t5]
+    
+    coeffs = CubicSpline(points_k, t_values)
+    
+    return coeffs
+
+def compute_threshold(v_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, t_k_initial):
+    # result = fsolve(
+    #     lambda t_k: euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h),
+    #     x0=t_k_initial,
+    #     maxfev=500,
+    #     #fprime=lambda t_k: euler_equation_derivative(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h),
+    #     xtol=10e-10
+    # )
+    # return result[0]
+    
+    # def threshold_eq(t_k):
+    #     return euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)
+
+    solution = root(lambda t_k: penalized_euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h),
+                    #fprime=lambda t_k: euler_equation_derivative(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h),
+                    #col_deriv = True,
+                    x0=t_k_initial, options = {'ftol': 10e-12}, method='lm')
+    return solution.x[0]
+    # if solution.success:
+    #     return solution.x[0]
+    # else:
+    #     raise ValueError(f"Root finding failed: {solution.message}")
+        
+    
+    # result = minimize(
+    #     lambda t_k: euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)**2, 
+    #     x0=t_k_initial,
+    #     #jac=lambda t_k: 2 * euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h) *
+    #     #                euler_equation_derivative(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h),
+    #     method='L-BFGS-B',
+    #     tol = 10e-8,
+    #     bounds=[(v_lower_l, v_upper_l)]
+    # )
+    #return result.x[0]
+    #return fsolve(lambda t_k: euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)**2, xtol=10e-6, x0=t_k_initial)[0]
+    #]fprime = lambda t_k: euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)*euler_equation_derivative(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h), x0=t_k_initial)[0]
+    #return fsolve(lambda t_k: euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h), fprime = lambda t_k: euler_equation_derivative(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h), x0=t_k_initial)[0]
+
+def compute_thresholds_vector(v_k_vector, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, t_k_initial_vector):
+    thresholds_eq = lambda t_k: penalized_euler_equation(v_k_vector, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h)
+    threshold_prime_eq = lambda t_k: euler_equation_derivative(v_k_vector, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)
+    solution = root(thresholds_eq, x0=t_k_initial_vector,
+                    options = {'ftol': 1e-10, 'maxiter': 5000}, method='lm')
+    
+    #solution = root(thresholds_eq, x0=t_k_initial_vector,
+    #                options = {'ftol': 10e-10}, method='broyden1')
+    
+    return solution.x
+    
+    #if solution.success:
+    #    return solution.x
+    #else:
+    #    raise ValueError(f"Root finding failed: {solution.message}")
+        
+def compute_threshold_min(v_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, t_k_initial):
+    """
+    Compute thresholds for a vector of valuations using the minimize approach.
+    
+    :param v_k_vector: Vector of valuations for side_k.
+    :param F_k: CDF function for side_k.
+    :param f_k: PDF function for side_k.
+    :param F_l: CDF function for side_l.
+    :param f_l: PDF function for side_l.
+    :param v_upper_k: Upper bound for side_k.
+    :param v_lower_k: Lower bound for side_k.
+    :param v_upper_l: Upper bound for side_l.
+    :param v_lower_l: Lower bound for side_l.
+    :param h: Discretization step.
+    :param t_k_initial_vector: Initial guess for the thresholds.
+    :return: Vector of computed thresholds.
+    """
+    
+    def objective_function(t_k):
+        # The objective function is the sum of squares of the penalized euler equations
+        return euler_equation(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)**2
+
+    # Minimize the objective function to find the thresholds
+    solution = minimize(
+        fun=objective_function,
+        x0=t_k_initial,
+        method='L-BFGS-B',  # Use a method suitable for bounded problems
+        bounds=(v_lower_l, v_upper_l),  # Apply bounds to each element in the vector
+        options = {'ftol': 1e-24}# Set a tolerance level
+    )
+    
+    # Return the optimized threshold values
+    return solution.x[0]
+
+def compute_thresholds_vector_min(v_k_vector, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, h, t_k_initial_vector):
+    """
+    Compute thresholds for a vector of valuations using the minimize approach.
+    
+    :param v_k_vector: Vector of valuations for side_k.
+    :param F_k: CDF function for side_k.
+    :param f_k: PDF function for side_k.
+    :param F_l: CDF function for side_l.
+    :param f_l: PDF function for side_l.
+    :param v_upper_k: Upper bound for side_k.
+    :param v_lower_k: Lower bound for side_k.
+    :param v_upper_l: Upper bound for side_l.
+    :param v_lower_l: Lower bound for side_l.
+    :param h: Discretization step.
+    :param t_k_initial_vector: Initial guess for the thresholds.
+    :return: Vector of computed thresholds.
+    """
+    
+    def objective_function(t_k):
+        # The objective function is the sum of squares of the penalized euler equations
+        return np.sum(euler_equation(v_k_vector, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)**2)
+
+    # Minimize the objective function to find the thresholds
+    solution = minimize(
+        fun=objective_function,
+        x0=t_k_initial_vector,
+        method='L-BFGS-B',  # Use a method suitable for bounded problems
+        bounds=[(v_lower_l, v_upper_l)] * len(t_k_initial_vector),  # Apply bounds to each element in the vector
+        options = {'ftol': 1e-24}# Set a tolerance level
+    )
+    
+    # Return the optimized threshold values
+    return solution.x
+
+def compute_omega(F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, h):
+    #omega_eq = lambda omega: (compute_threshold(omega, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h, v_upper_l/2) - v_upper_l)**2
+    #omega_eq = lambda v_k: euler_equation(v_k, v_upper_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)
+    #omega = fsolve(omega_eq, x0=v_upper_k/2, full_output=True)[0]
+    #omega = fsolve(omega_eq, x0=v_lower_k, maxfev = 1000, xtol=10e-10)[0]
+    
+      
+    def objective_function(t_k):
+        # The objective function is the sum of squares of the penalized euler equations
+        return euler_equation(t_k, v_upper_l, F_k, f_k, F_l, f_l, v_upper_k, v_upper_l, h)**2
+    
+    t_k_initial = (v_lower_k + v_upper_k)/2
+    # Minimize the objective function to find the thresholds
+    solution = minimize(
+        fun=objective_function,
+        x0=t_k_initial,
+        method='L-BFGS-B',  # Use a method suitable for bounded problems
+        bounds=[(v_lower_k, v_upper_k)],  # Apply bounds to each element in the vector
+        options = {'ftol': 1e-24}# Set a tolerance level
+    )
+    
+    # Return the optimized threshold values
+    return solution.x[0]
+    #solution = root(omega_eq,
+    #                x0=(v_lower_k + v_upper_k)/2, options = {'ftol': 10e-10}, method='lm')
+    #return solution.x[0]
+
+    #omega = root(omega_eq, x0=v_upper_k, options = {'xtol': 10e-10, 'maxfev':500}, method='lm').x[0]
+    #return omega
+
+alpha = -0.5
+
+def sigma(v):
+    if alpha == 0:
+        return v
+    else:
+        v = np.maximum(v,1e-10)
+        return v**(1+alpha)
+    
+def sigma_prime(v):
+    if alpha == 0:
+        return 1
+    else:
+        v = np.maximum(v,1e-10)
+        return (1+alpha)*v**alpha
+
+def rho(x):
+        return np.log(x)
+
+def compute_payment_lower(v_lower_k, v_upper_l, F_l, t_l_lower):
+        return v_lower_k*rho(average_intensity(t_l_lower, F_l, v_upper_l))
+    
+def compute_payments_from_envelope(v_k, t_k, F_k, f_k, F_l, f_l, v_upper_k, v_lower_k, v_upper_l, v_lower_l, p_lower_l):
+    # Ensure v_lower_k is included in the vector of valuations
+    if v_lower_k not in v_k:
+        v_k_temp = np.insert(v_k, 0, v_lower_k)
+        t_k_temp = np.insert(t_k, 0, v_upper_l)
+    
+    # Compute integral1 using the parallelized average_intensity function
+    integral1 = v_k_temp * rho(average_intensity(t_k_temp, F_l, v_upper_l))
+    
+    # Compute rho(average_intensity) for the entire vector
+    rho_values = rho(average_intensity(t_k_temp, F_l, v_upper_l))
+    
+    # Compute integral2 using cumulative trapezoidal integration from v_lower_k to each v_k
+    integral2 = cumulative_trapezoid(rho_values, v_k_temp, initial=0)
+    
+    # Calculate payments
+    payments = integral1[1:] - integral2[1:] - p_lower_l
+    
+    return payments
+
+def chi(v, F, f, v_upper, h):
+    
+    if h == "P":
+        chi = virtual_valuation(v, F, f, h)*average_intensity(v, F, v_upper)/sigma(v)
+        #print(v-F(v))
+    elif h == "W":
+        chi = average_intensity(v, F, v_upper)
+    
+    return chi
+            
+def compute_and_check_increasing(v_values, chi_values):
+    """
+    Compute the numeric derivatives of chi with respect to v and check how many are positive.
+
+    :param v_values: Array of v values.
+    :param chi_values: Array of chi values corresponding to v_values.
+    :return: Tuple containing the number of positive derivatives and the total number of derivatives.
+    """
+    derivatives = np.diff(chi_values) / np.diff(v_values)
+    num_positive = np.sum(derivatives > 0)
+    total = len(derivatives)
+    return num_positive, total
+
+def create_error_generator(distribution_name, params):
+    """
+    Reconstructs an error generator given the distribution name and parameters.
+
+    :param distribution_name: Name of the distribution (e.g., 'truncnorm', 'norm').
+    :param params: Dictionary of parameters for the distribution.
+    :return: A scipy.stats distribution object.
+    """
+    from scipy.stats import truncnorm, norm  # Import necessary distributions
+
+    if distribution_name == 'truncnorm':
+        return truncnorm(*params)
+    elif distribution_name == 'norm':
+        return norm(*params)
+    else:
+        raise ValueError(f"Unsupported distribution: {distribution_name}")

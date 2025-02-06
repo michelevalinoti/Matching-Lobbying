@@ -1,70 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 Created on Sun Jun 18 15:25:54 2023
-
 @author: michelev
 """
 
+# Importing necessary libraries
 import pandas as pd
 import numpy as np
 import math
-
 import re
-
 import sys, os
-
 import matplotlib.pyplot as plt
-
 from itertools import chain
-
 import statsmodels.api as sm
 from patsy import dmatrices
-
-from Base import *
+from Base import *  # Importing all from a module named Base
 from datetime import datetime
-
 import json
 import ast
-#%%
 
+# Setting up a directory path for data processing
 machine = "/Users/michelev/Dropbox/lobbying/"
-
-#%%
-
 legi_subfolder = "data/NYS_LegiScan/"
 
+# Function to create DataFrames for legislation data
 def createLegislationDataFrames():
-    
-    #session_starts = np.arange(2019, 2025, 2)
+    # Define a range of session start years
     session_starts = np.arange(2009, 2025, 2)
-    
+
+    # Initialize dictionaries and DataFrames to store session and bill information
     sessions_dict = {'session_name': [], 'session_id': [], 'session_odd_year': [], 'session_even_year': []}
-    bills_tot_df = pd.DataFrame();
+    bills_tot_df = pd.DataFrame()
     bills_detailed_df = pd.DataFrame()
     people_tot_df = pd.DataFrame()
-    
     sponsors_df = pd.DataFrame()
     history_df = pd.DataFrame()
     missing_ref = {}
+
+    # Loop through each session start year
     for session_start in session_starts:
-        
-        print(session_start,flush=True)
+        print(session_start, flush=True)  # Print the session start year
+
+        # Constructing file paths for CSV and JSON data
         folder_path_csv = os.path.join(machine, legi_subfolder + "csv/" + str(session_start) + "-" + str(session_start+1) + "_General_Assembly/csv/")
         folder_path_json = os.path.join(machine, legi_subfolder + "json/" + str(session_start) + "-" + str(session_start+1) + "_General_Assembly/")
         folder_list_json = os.listdir(folder_path_json + "bill/")
-        
+
+        # Reading bills.csv file and defining columns to keep
         bills_df = pd.read_csv(folder_path_csv + "bills.csv")
         columns_to_keep_bill = ['bill_id', 'session_id', 'bill_number', 'bill_type', 'bill_type_id',
-                           'body', 'body_id', 'committee', 'progress', 'referrals', 'sasts', 'sponsors']
+                                'body', 'body_id', 'committee', 'progress', 'referrals', 'sasts', 'sponsors']
         columns_to_keep_sponsors = ['people_id', 'name', 'sponsor_type_id', 'sponsor_order',
                                     'committee_sponsor', 'committee_id']
+        
+        # Loop through each JSON file in the bill folder
         for json_file in folder_list_json:
-            #print(json_file)
-            bills_detail = pd.read_json(folder_path_json + "bill/" + json_file, orient = 'index')
+            bills_detail = pd.read_json(folder_path_json + "bill/" + json_file, orient='index')
             bills_detail = bills_detail[columns_to_keep_bill]
             bills_detailed_df = pd.concat((bills_detailed_df, bills_detail), axis=0)
-            
+
+            # Processing bill progress information and dates
             progress_bill_df = pd.DataFrame(bills_detail.progress[0])
             if len(progress_bill_df) > 0:
                 progress_bill_df['date'] = pd.to_datetime(progress_bill_df.date)
@@ -72,19 +69,19 @@ def createLegislationDataFrames():
                 progress_bill_df['month'] = progress_bill_df.date.dt.month
                 progress_bill_df['day'] = progress_bill_df.date.dt.day
                 progress_bill_df['date_number'] = progress_bill_df.date.dt.year + progress_bill_df.date.dt.day_of_year/365
-                progress_bill_df['event_within_rank'] =  progress_bill_df.groupby('event')['date_number'].rank().astype(int)
+                progress_bill_df['event_within_rank'] = progress_bill_df.groupby('event')['date_number'].rank().astype(int)
                 progress_bill_df['event_rank'] = progress_bill_df['date_number'].rank().astype(int)
-                
+
+                # Processing committee and referral information
                 committee_bill_df = pd.DataFrame.from_dict(bills_detail.committee[0], orient='index').transpose()
                 committee_bill_series = pd.Series(bills_detail.committee[0], dtype='object')
                 referrals_bill_df = pd.DataFrame(bills_detail.referrals[0])
-                
+
+                # Additional data processing for referrals and history
                 if len(referrals_bill_df)>0:
-                    
                     referrals_bill_df['date'] = pd.to_datetime(referrals_bill_df.date)
                     referrals_bill_df_ = referrals_bill_df[['committee_id', 'chamber', 'chamber_id', 'name']]
                     is_contained = referrals_bill_df_[referrals_bill_df_.apply(lambda row: row.equals(committee_bill_series), axis=1)].any().all()
-                    
                     referrals_bill_df['event'] = 9
                     history_bill_df = progress_bill_df.merge(referrals_bill_df, on = ['date', 'event'], how = 'left')
                     missing_committees = pd.isna(history_bill_df.committee_id) & (history_bill_df.event == 9)
@@ -93,54 +90,48 @@ def createLegislationDataFrames():
                         if min(history_bill_df.loc[missing_committees & (history_bill_df.event == 9),'event_within_rank']) == 1:
                             for col in ['committee_id', 'chamber', 'chamber_id', 'name']:
                                 history_bill_df.loc[(history_bill_df.event == 9) & (history_bill_df.event_within_rank == 1), col] = bills_detail.committee[0][col]
-                            
                 else:
                     history_bill_df = progress_bill_df.copy()
-                
+
                 history_bill_df['bill_id'] = bills_detail.bill_id[0]
                 history_bill_df['session_id'] = bills_detail.session_id[0]
                 history_df = pd.concat((history_df, history_bill_df), axis=0)
+
+            # Processing sponsor information
             if len(bills_detail.sponsors[0]) > 0:
                 sponsors_bill_df = pd.DataFrame(bills_detail.sponsors[0])[columns_to_keep_sponsors]
                 sponsors_bill_df['bill_id'] = bills_detail.bill_id[0]
                 sponsors_bill_df['session_id'] = bills_detail.session_id[0]
                 sponsors_df = pd.concat((sponsors_df, sponsors_bill_df), axis=0)
-            
         
-        
+        # Continue processing session data and saving to DataFrames
         session_id = pd.unique(bills_df['session_id'])[0]
         sessions_dict['session_name'].append(str(session_start) + "-" + str(session_start+1))
-        sessions_dict['session_odd_year'].append(session_start);
-        sessions_dict['session_even_year'].append(session_start+1);
+        sessions_dict['session_odd_year'].append(session_start)
+        sessions_dict['session_even_year'].append(session_start+1)
         sessions_dict['session_id'].append(session_id)
         
         people_df = pd.read_csv(folder_path_csv + "people.csv")
         people_df['session_id'] = session_id
-        
-        #history_df = pd.read_csv(legi_subfolder + "history.csv")
-        #history_df['session_id'] = session_id
-     
         bills_tot_df = pd.concat((bills_tot_df, bills_df), axis=0)
         people_tot_df = pd.concat((people_tot_df, people_df), axis=0)
-    
 
+    # Saving the processed data to CSV files
     bills_detailed_df.to_csv(machine + legi_subfolder + 'bills_details_all.csv')
     history_df.to_csv(machine + legi_subfolder + 'history_all.csv')
     sponsors_df.to_csv(machine + legi_subfolder + 'sponsors_all.csv')
-        
     people_tot_df.set_index('people_id', inplace=True)
     columns_to_upper = ['first_name', 'middle_name', 'last_name', 'suffix', 'nickname']
     people_tot_df[columns_to_upper] = people_tot_df[columns_to_upper].apply(lambda col: col.str.upper())
     people_tot_df[columns_to_upper] = people_tot_df[columns_to_upper].apply(remove_accents_from_string)
     people_tot_df.to_csv(machine + legi_subfolder +'people_all.csv')
-    
     bills_tot_df.set_index('bill_id')
     bills_tot_df.to_csv(machine + legi_subfolder + 'bills_all.csv')
-    
-    sessions_tot_df = pd.DataFrame(sessions_dict);
+    sessions_tot_df = pd.DataFrame(sessions_dict)
     sessions_tot_df.set_index('session_id', inplace=True)
     sessions_tot_df.to_csv(machine + legi_subfolder + 'sessions_all.csv')
-    
+
+# Function definition for `findCommittees'
 def findCommittees():
     
     bills_tot_df = pd.read_csv(machine + legi_subfolder + 'bills_all.csv')
@@ -456,10 +447,6 @@ query_tables_names = ['lobbyist_list',
 #state_activities = createLobbyingDataFrame(query_tables_names[4])
 #municipal_activities = createLobbyingDataFrame(query_tables_names[5])
 #parties_lobbied = createLobbyingDataFrame(query_tables_names[6])
-
-sys.exit()
-
-#%%
 
 
 expenditures_subfolder = "data/NYS_Expenditures/"
@@ -786,8 +773,6 @@ def cleanPartiesDataFrame(df):
     # Remove leading and trailing newlines from all columns
 #%%
 
-api_link = "http://api.followthemoney.org/?dt=1&c-t-eid=26158013&APIKey=636b7371feb3ad6fd7e489d028eed3fa&mode=json"
-response = requests.get(api_link)
 
 #%%
 parties_lobbied = pd.read_csv(machine + ethics_subfolder + 'parties_lobbied_all_sessions.csv')
