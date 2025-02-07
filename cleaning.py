@@ -610,7 +610,6 @@ def extractExpenditures():
 
 #     folder_path = os.path.join(machine + contributions_subfolder, "ALL_REPORTS_StateCommittee/")
 #     contributions_tot_df = pd.read_csv(folder_path + "STATE_COMMITTEE.csv",encoding='latin-1')
-#     http://api.followthemoney.org/?dt=1&y=2023&APIKey=636b7371feb3ad6fd7e489d028eed3fa&mode=json
 
 #%%
 def cleanPartiesDataFrame(df):
